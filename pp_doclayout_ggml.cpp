@@ -340,6 +340,11 @@ ggml_custom_kernel_hdr kReduceMaxHdr = {GGML_CUSTOM_KERNEL_MAGIC, GGML_CUSTOM_KE
 ggml_custom_kernel_hdr kReduceMinHdr = {GGML_CUSTOM_KERNEL_MAGIC, GGML_CUSTOM_KERNEL_REDUCE_MIN};
 ggml_custom_kernel_hdr kReduceSumHdr = {GGML_CUSTOM_KERNEL_MAGIC, GGML_CUSTOM_KERNEL_REDUCE_SUM};
 
+ggml_tensor * tag_custom_kernel(ggml_tensor * tensor, const ggml_custom_kernel_hdr & hdr) {
+    ggml_custom_kernel_tag(tensor, static_cast<ggml_custom_kernel_kind>(hdr.kind));
+    return tensor;
+}
+
 // Elementwise erf for ONNX `Erf` (ggml has no standalone erf op). CPU fallback
 // for the tagged custom op; both tensors are contiguous f32.
 void erf_custom_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
@@ -498,6 +503,7 @@ void msdeform_attn_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
     const int64_t off_stride = static_cast<int64_t>(H) * L * P * 2; // 192
     const int64_t att_stride = static_cast<int64_t>(L) * P;         // 12
     const int64_t HQ = static_cast<int64_t>(H) * Q;
+    const float inv_points = 1.0f / static_cast<float>(P);
     for (int64_t item = ith; item < HQ; item += nth) {
         const int64_t h = item / Q;
         const int64_t q = item % Q;
@@ -515,8 +521,8 @@ void msdeform_attn_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
                 const float ox = O[ob];
                 const float oy = O[ob + 1];
                 // loc = ref_center + offset/num_points * ref_wh * 0.5; grid = 2*loc-1.
-                const float locx = cx + (ox * 0.25f) * rw * 0.5f;
-                const float locy = cy + (oy * 0.25f) * rh * 0.5f;
+                const float locx = cx + (ox * inv_points) * rw * 0.5f;
+                const float locy = cy + (oy * inv_points) * rh * 0.5f;
                 const float gx = 2.0f * locx - 1.0f;
                 const float gy = 2.0f * locy - 1.0f;
                 const float ix = ((gx + 1.0f) * static_cast<float>(Wl) - 1.0f) * 0.5f;
@@ -2088,6 +2094,7 @@ bool Engine::prepare_plan_prefix_impl(
         cfg_storage.push_back(cfg);
         produced = ggml_custom_4d(ctx, GGML_TYPE_F32, Q, cfg.head_dim, cfg.heads, 1, args, 4,
                                   msdeform_attn_op, GGML_N_TASKS_MAX, &cfg_storage.back());
+        tag_custom_kernel(produced, cfg_storage.back().hdr);
         // ONNX output [heads, head_dim, Q].
         onnx_shapes[blk.output] = {cfg.heads, cfg.head_dim, Q};
         return true;
@@ -2710,6 +2717,7 @@ bool Engine::prepare_plan_prefix_impl(
                 produced = ggml_custom_4d(ctx, GGML_TYPE_F32, cont->ne[0], cont->ne[1],
                                           cont->ne[2], cont->ne[3], args, 1, erf_custom_op,
                                           GGML_N_TASKS_MAX, &kErfHdr);
+                tag_custom_kernel(produced, kErfHdr);
             }
             onnx_shapes[node.outputs[0]] = get_onnx_shape(node.inputs[0]);
         } else if (node.op_type == "Squeeze" || node.op_type == "Unsqueeze") {
@@ -2936,6 +2944,7 @@ bool Engine::prepare_plan_prefix_impl(
                                                                                 : &kReduceSumHdr;
                     ggml_tensor * flat = ggml_custom_4d(ctx, GGML_TYPE_F32, rows, 1, 1, 1,
                         src_args, 1, fun2, GGML_N_TASKS_MAX, hdr2);
+                    tag_custom_kernel(flat, *hdr2);
                     const bool kd = attr_int(node.attrs, "keepdims", 1) != 0;
                     std::vector<int64_t> out_shape = in_shape;
                     if (kd) {
@@ -2970,6 +2979,7 @@ bool Engine::prepare_plan_prefix_impl(
                                                                        : &kReduceSumHdr;
             ggml_tensor * flat = ggml_custom_4d(ctx, GGML_TYPE_F32, rows, 1, 1, 1, src_args, 1, fun,
                                                 GGML_N_TASKS_MAX, hdr);
+            tag_custom_kernel(flat, *hdr);
             const bool keepdims = attr_int(node.attrs, "keepdims", 1) != 0;
             std::vector<int64_t> out_shape = in_shape;
             if (keepdims) {
