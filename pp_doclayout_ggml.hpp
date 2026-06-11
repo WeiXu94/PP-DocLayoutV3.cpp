@@ -98,6 +98,9 @@ private:
     GgufWeightsSummary weights_;
     gguf_context * weights_ctx_ = nullptr;
     ggml_context * weights_meta_ctx_ = nullptr;
+    // Entire GGUF file cached in RAM so per-inference tensor reads are memcpy
+    // from memory instead of 1899 fresh ifstream opens against disk each call.
+    std::vector<uint8_t> weights_blob_;
     std::string error_;
 };
 

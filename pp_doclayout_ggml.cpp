@@ -766,6 +766,8 @@ void Engine::close_weights() {
         ggml_free(weights_meta_ctx_);
         weights_meta_ctx_ = nullptr;
     }
+    weights_blob_.clear();
+    weights_blob_.shrink_to_fit();
     weights_ = GgufWeightsSummary{};
 }
 
@@ -821,6 +823,29 @@ bool Engine::load_weights(const std::string & path) {
     if (weights_.largest_tensors.size() > 8) {
         weights_.largest_tensors.resize(8);
     }
+
+    // Cache the whole GGUF file in RAM once, so per-inference tensor reads are
+    // memcpy from memory rather than reopening the file 1899x per run.
+    {
+        std::ifstream in(path, std::ios::binary | std::ios::ate);
+        if (!in) {
+            error_ = "failed to open GGUF weights for caching: " + path;
+            close_weights();
+            return false;
+        }
+        const std::streamoff total = in.tellg();
+        weights_blob_.resize(total > 0 ? static_cast<size_t>(total) : 0);
+        in.seekg(0, std::ios::beg);
+        if (!weights_blob_.empty()) {
+            in.read(reinterpret_cast<char *>(weights_blob_.data()),
+                    static_cast<std::streamsize>(weights_blob_.size()));
+        }
+        if (!in.good() && !in.eof()) {
+            error_ = "failed to cache GGUF weights into memory: " + path;
+            close_weights();
+            return false;
+        }
+    }
     return true;
 }
 
@@ -836,6 +861,15 @@ bool Engine::read_tensor_bytes(const std::string & name, std::vector<uint8_t> & 
     }
     const size_t size = gguf_get_tensor_size(weights_ctx_, tensor_id);
     const size_t offset = gguf_get_data_offset(weights_ctx_) + gguf_get_tensor_offset(weights_ctx_, tensor_id);
+    if (!weights_blob_.empty()) {
+        if (offset + size > weights_blob_.size()) {
+            error_ = "tensor data out of range in cached GGUF: " + name;
+            return false;
+        }
+        data.resize(size);
+        std::memcpy(data.data(), weights_blob_.data() + offset, size);
+        return true;
+    }
     std::ifstream in(weights_.path, std::ios::binary);
     if (!in) {
         error_ = "failed to open GGUF weights for tensor read: " + weights_.path;
@@ -1393,8 +1427,41 @@ bool Engine::run_plan_prefix_impl(
         return false;
     }
 
+    // CPU fallback backend so a multi-backend scheduler can run each op on the
+    // preferred backend (e.g. Metal) when supported, and fall back to CPU for the
+    // rest (custom kernels, and ops the GPU backend lacks). Skipped when the
+    // preferred backend is already the CPU (single-backend schedule).
+    ggml_backend_t backend_cpu = nullptr;
+    {
+        ggml_backend_dev_t pref_dev = ggml_backend_get_device(backend);
+        if (!pref_dev || ggml_backend_dev_type(pref_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        }
+    }
+
     constexpr size_t kMaxTensors = 32768;
     constexpr size_t kMaxGraphNodes = 32768;
+
+    ggml_backend_t sched_backends[2];
+    int n_sched_backends = 0;
+    sched_backends[n_sched_backends++] = backend; // preferred backend first
+    if (backend_cpu) {
+        sched_backends[n_sched_backends++] = backend_cpu;
+    }
+    // op_offload=true: offload heavy ops (mat-mul, and the im2col+mat-mul convs)
+    // to the GPU even though the weights live in CPU-side buffers; the scheduler
+    // copies operands as needed. Without it, ops co-locate with their CPU weights.
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        sched_backends, nullptr, n_sched_backends, kMaxGraphNodes, false, true);
+    if (!sched) {
+        if (backend_cpu) {
+            ggml_backend_free(backend_cpu);
+        }
+        ggml_backend_free(backend);
+        error_ = "failed to create GGML backend scheduler";
+        return false;
+    }
+
     const size_t ctx_size = ggml_tensor_overhead() * kMaxTensors +
                             ggml_graph_overhead_custom(kMaxGraphNodes, false) +
                             (8u << 20);
@@ -1404,9 +1471,31 @@ bool Engine::run_plan_prefix_impl(
     params.no_alloc = true;
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
+        ggml_backend_sched_free(sched);
+        if (backend_cpu) {
+            ggml_backend_free(backend_cpu);
+        }
         ggml_backend_free(backend);
         error_ = "failed to allocate GGML context (size=" + std::to_string(ctx_size) +
                  " tensors=" + std::to_string(kMaxTensors) + " nodes=" + std::to_string(kMaxGraphNodes) + ")";
+        return false;
+    }
+
+    // Separate context for constant/weight leaves. These are allocated up front in
+    // a host buffer tagged USAGE_WEIGHTS so the scheduler will offload the matmul/
+    // conv ops that consume them to the GPU (ggml only offloads ops whose weight
+    // operand lives in such a buffer). Compute tensors + runtime inputs stay in ctx.
+    ggml_init_params wparams = params;
+    ggml_context * wctx = ggml_init(wparams);
+    ggml_backend_buffer_t weights_buf = nullptr;
+    if (!wctx) {
+        ggml_free(ctx);
+        ggml_backend_sched_free(sched);
+        if (backend_cpu) {
+            ggml_backend_free(backend_cpu);
+        }
+        ggml_backend_free(backend);
+        error_ = "failed to allocate GGML weights context";
         return false;
     }
 
@@ -1414,7 +1503,15 @@ bool Engine::run_plan_prefix_impl(
         if (buffer) {
             ggml_backend_buffer_free(buffer);
         }
+        if (weights_buf) {
+            ggml_backend_buffer_free(weights_buf);
+        }
+        ggml_backend_sched_free(sched);
         ggml_free(ctx);
+        ggml_free(wctx);
+        if (backend_cpu) {
+            ggml_backend_free(backend_cpu);
+        }
         ggml_backend_free(backend);
     };
 
@@ -1466,7 +1563,7 @@ bool Engine::run_plan_prefix_impl(
             error_ = "missing weight tensor in GGUF: " + name;
             return nullptr;
         }
-        ggml_tensor * tensor = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+        ggml_tensor * tensor = ggml_new_tensor_4d(wctx, GGML_TYPE_F32,
                                                   meta->ne[0], meta->ne[1], meta->ne[2], meta->ne[3]);
         ggml_set_name(tensor, name.c_str());
         weight_storage.emplace_back();
@@ -1501,7 +1598,7 @@ bool Engine::run_plan_prefix_impl(
     // Add a per-channel constant tensor [1, 1, C, 1] for folded BatchNorm.
     auto make_channel_const = [&](const std::string & name, std::vector<float> data) -> ggml_tensor * {
         ggml_tensor * tensor =
-            ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, static_cast<int64_t>(data.size()), 1);
+            ggml_new_tensor_4d(wctx, GGML_TYPE_F32, 1, 1, static_cast<int64_t>(data.size()), 1);
         ggml_set_name(tensor, name.c_str());
         param_storage.push_back(std::move(data));
         std::vector<float> & stored = param_storage.back();
@@ -2223,7 +2320,7 @@ bool Engine::run_plan_prefix_impl(
                     for (size_t j = 0; j < part_shape.size() && j < 4; ++j) {
                         ne[j] = part_shape[part_shape.size() - 1 - j];
                     }
-                    t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+                    t = ggml_new_tensor_4d(wctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
                     uploads.push_back({t, fv_store.data(), fv_store.size() * sizeof(float)});
                     onnx_shapes[name] = part_shape;
                 } else if (gather_index.count(name)) {
@@ -2573,7 +2670,7 @@ bool Engine::run_plan_prefix_impl(
                 const auto & ivec = int_values[node.inputs[0]];
                 param_storage.emplace_back(ivec.begin(), ivec.end());
                 auto & fvec = param_storage.back();
-                x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, static_cast<int64_t>(ivec.size()), 1, 1, 1);
+                x = ggml_new_tensor_4d(wctx, GGML_TYPE_F32, static_cast<int64_t>(ivec.size()), 1, 1, 1);
                 ggml_set_name(x, node.inputs[0].c_str());
                 uploads.push_back({x, fvec.data(), fvec.size() * sizeof(float)});
                 values[node.inputs[0]] = x;
@@ -3209,7 +3306,7 @@ bool Engine::run_plan_prefix_impl(
                 return false;
             }
             float divisor = static_cast<float>(divisor_vec[0]);
-            ggml_tensor * denom = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1);
+            ggml_tensor * denom = ggml_new_tensor_4d(wctx, GGML_TYPE_F32, 1, 1, 1, 1);
             ggml_set_name(denom, (node.name + ".divisor").c_str());
             param_storage.push_back({divisor});
             uploads.push_back({denom, param_storage.back().data(), sizeof(float)});
@@ -3250,7 +3347,7 @@ bool Engine::run_plan_prefix_impl(
                 param_storage.emplace_back(iv.size(), 0.0f);
                 auto & fv = param_storage.back();
                 for (size_t j = 0; j < iv.size(); ++j) fv[j] = static_cast<float>(iv[j]);
-                out = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, static_cast<int64_t>(iv.size()), 1, 1, 1);
+                out = ggml_new_tensor_4d(wctx, GGML_TYPE_F32, static_cast<int64_t>(iv.size()), 1, 1, 1);
                 uploads.push_back({out, fv.data(), fv.size() * sizeof(float)});
                 return true;
             };
@@ -3345,7 +3442,7 @@ bool Engine::run_plan_prefix_impl(
                     cleanup(nullptr);
                     return false;
                 }
-                ggml_tensor * inj_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, produced->ne[0],
+                ggml_tensor * inj_t = ggml_new_tensor_4d(wctx, GGML_TYPE_F32, produced->ne[0],
                                                          produced->ne[1], produced->ne[2],
                                                          produced->ne[3]);
                 ggml_set_name(inj_t, out_name.c_str());
@@ -3374,16 +3471,40 @@ bool Engine::run_plan_prefix_impl(
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, kMaxGraphNodes, false);
     ggml_build_forward_expand(graph, output);
 
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!buffer) {
+    // Pre-allocate all constant/weight leaves (wctx) in a host buffer tagged
+    // USAGE_WEIGHTS. This is what makes the scheduler offload the matmul/conv ops
+    // that consume them to the GPU (it only offloads ops whose weight operand is in
+    // such a buffer). Runtime inputs stay in ctx and are scheduler-allocated.
+    {
+        ggml_backend_buffer_type_t host_buft =
+            ggml_backend_get_default_buffer_type(backend_cpu ? backend_cpu : backend);
+        weights_buf = ggml_backend_alloc_ctx_tensors_from_buft(wctx, host_buft);
+        if (!weights_buf) {
+            cleanup(nullptr);
+            error_ = "failed to allocate GGML weights buffer";
+            return false;
+        }
+        ggml_backend_buffer_set_usage(weights_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+    // Only the runtime inputs are graph inputs; weights are pre-placed above.
+    ggml_set_input(input);
+    ggml_set_input(im_shape);
+    ggml_set_input(scale_factor);
+    if (!ggml_backend_sched_alloc_graph(sched, graph)) {
         cleanup(nullptr);
-        error_ = "failed to allocate GGML tensor buffer";
+        error_ = "failed to allocate GGML graph via scheduler";
         return false;
     }
     for (size_t upload_index = 0; upload_index < uploads.size(); ++upload_index) {
         const Upload & upload = uploads[upload_index];
+        // The scheduler only allocates tensors reachable from the requested
+        // output; leaves created for unrelated branches get no buffer and need
+        // no upload (their data is never read).
+        if (upload.tensor->buffer == nullptr) {
+            continue;
+        }
         if (upload.bytes > ggml_nbytes(upload.tensor)) {
-            cleanup(buffer);
+            cleanup(nullptr);
             error_ = "upload size mismatch for " + std::string(upload.tensor->name) +
                      ": type=" + ggml_type_name(upload.tensor->type) + " ne=[" +
                      std::to_string(upload.tensor->ne[0]) + "," +
@@ -3397,16 +3518,21 @@ bool Engine::run_plan_prefix_impl(
         ggml_backend_tensor_set(upload.tensor, upload.data, 0, upload.bytes);
     }
 
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-        cleanup(buffer);
+    const int64_t t_compute0 = ggml_time_us();
+    if (ggml_backend_sched_graph_compute(sched, graph) != GGML_STATUS_SUCCESS) {
+        cleanup(nullptr);
         error_ = "GGML plan-prefix graph failed";
         return false;
+    }
+    if (std::getenv("PPDOC_TIMING")) {
+        fprintf(stderr, "[ppdoc] graph_compute_ms=%.1f\n",
+                (ggml_time_us() - t_compute0) / 1000.0);
     }
 
     output_values.assign(static_cast<size_t>(ggml_nelements(output)), 0.0f);
     const size_t output_bytes = output_values.size() * sizeof(float);
     if (output_bytes > ggml_nbytes(output)) {
-        cleanup(buffer);
+        cleanup(nullptr);
         error_ = "output copy size mismatch for " + output_name +
                  ": type=" + ggml_type_name(output->type) + " ne=[" +
                  std::to_string(output->ne[0]) + "," + std::to_string(output->ne[1]) + "," +
@@ -3422,7 +3548,7 @@ bool Engine::run_plan_prefix_impl(
     result.output_shape_nchw = {output->ne[3], output->ne[2], output->ne[1], output->ne[0]};
     result.output_values = static_cast<int64_t>(output_values.size());
 
-    cleanup(buffer);
+    cleanup(nullptr);
     return true;
 }
 

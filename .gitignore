@@ -1,3 +1,30 @@
-build/
+build*/
+build-cpu/
+build-metal/
 cmake-build-*/
 .DS_Store
+
+# Output folders
+artifacts/
+
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# CMake generated
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# Cache
+.cache/
+__pycache__/
+*.pyc
