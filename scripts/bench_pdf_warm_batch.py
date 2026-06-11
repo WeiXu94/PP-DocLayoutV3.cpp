@@ -51,6 +51,45 @@ def stats(samples_ms: list[float]) -> dict[str, float]:
     }
 
 
+def run_ort_batches(onnx_path: Path, pages_chw: list[np.ndarray], size: int,
+                    providers: list[str], warmup: int) -> list[dict]:
+    import onnxruntime as ort
+
+    feeds_const = {
+        "im_shape": np.array([[float(size), float(size)]], dtype=np.float32),
+        "scale_factor": np.array([[1.0, 1.0]], dtype=np.float32),
+    }
+    available = set(ort.get_available_providers())
+    results = []
+    for provider in providers:
+        if provider not in available:
+            results.append({"provider": provider, "skipped": True, "reason": "provider unavailable"})
+            continue
+        t0 = time.perf_counter()
+        sess = ort.InferenceSession(str(onnx_path), providers=[provider])
+        prepare_ms = (time.perf_counter() - t0) * 1000.0
+        out_names = [o.name for o in sess.get_outputs()]
+        first_feed = {"image": pages_chw[0], **feeds_const}
+        for _ in range(warmup):
+            sess.run(out_names, first_feed)
+        runs = []
+        for i, chw in enumerate(pages_chw, 1):
+            feed = {"image": chw, **feeds_const}
+            t1 = time.perf_counter()
+            sess.run(out_names, feed)
+            runs.append({"page": i, "run_ms": (time.perf_counter() - t1) * 1000.0})
+        run_ms = [float(r["run_ms"]) for r in runs]
+        results.append({
+            "provider": provider,
+            "skipped": False,
+            "prepare_ms": prepare_ms,
+            "warmup": warmup,
+            "stats": stats(run_ms),
+            "runs": runs,
+        })
+    return results
+
+
 def detections_from_output(rows: np.ndarray, labels: list[str], threshold: float) -> list[dict]:
     out = []
     for row in rows:
@@ -87,7 +126,8 @@ def annotate(img: Image.Image, detections: list[dict], size: int) -> Image.Image
     return out
 
 
-def markdown_report(pdf: Path, cli: dict, pages: list[dict], labels: Counter, total_wall_ms: float) -> str:
+def markdown_report(pdf: Path, cli: dict, ort_results: list[dict], pages: list[dict],
+                    labels: Counter, total_wall_ms: float) -> str:
     run_ms = [float(r["run_ms"]) for r in cli["runs"]]
     st = stats(run_ms)
     throughput = 1000.0 / st["p50"] if st["p50"] else 0.0
@@ -100,13 +140,26 @@ def markdown_report(pdf: Path, cli: dict, pages: list[dict], labels: Counter, to
         f"- prepare: {float(cli['prepare_ms']):.1f} ms",
         f"- wall total: {total_wall_ms:.1f} ms",
         "",
-        "| Mode | pages | p50 run (ms) | p90 run (ms) | mean run (ms) | min (ms) | max (ms) | pages/s p50 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
-        f"| GGML Metal warm batch | {len(pages)} | {st['p50']:.1f} | {st['p90']:.1f} | {st['mean']:.1f} | {st['min']:.1f} | {st['max']:.1f} | {throughput:.2f} |",
+        "| Backend | Mode | pages | prepare/session (ms) | p50 run (ms) | p90 run (ms) | mean run (ms) | min (ms) | max (ms) | pages/s p50 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        f"| GGML Metal | warm batch | {len(pages)} | {float(cli['prepare_ms']):.1f} | {st['p50']:.1f} | {st['p90']:.1f} | {st['mean']:.1f} | {st['min']:.1f} | {st['max']:.1f} | {throughput:.2f} |",
+    ]
+    for ort in ort_results:
+        provider = ort["provider"].replace("ExecutionProvider", "")
+        if ort.get("skipped"):
+            lines.append(f"| ONNXRuntime {provider} | skipped ({ort['reason']}) | 0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.00 |")
+            continue
+        ost = ort["stats"]
+        othr = 1000.0 / ost["p50"] if ost["p50"] else 0.0
+        lines.append(
+            f"| ONNXRuntime {provider} | warm session | {len(pages)} | {float(ort['prepare_ms']):.1f} | "
+            f"{ost['p50']:.1f} | {ost['p90']:.1f} | {ost['mean']:.1f} | {ost['min']:.1f} | {ost['max']:.1f} | {othr:.2f} |"
+        )
+    lines.extend([
         "",
         "| Page | detections >= threshold | run (ms) | top labels |",
         "|---:|---:|---:|---|",
-    ]
+    ])
     for page, run in zip(pages, cli["runs"]):
         top = Counter(det["label"] for det in page["detections"]).most_common(4)
         top_s = ", ".join(f"{k}={v}" for k, v in top)
@@ -129,16 +182,24 @@ def main() -> int:
     ap.add_argument("--manifest", type=Path, default=Path("artifacts/v3_manifest.json"))
     ap.add_argument("--weights", type=Path, default=Path("artifacts/v3_weights.gguf"))
     ap.add_argument("--plan", type=Path, default=Path("artifacts/v3_plan.json"))
+    ap.add_argument("--onnx", type=Path)
     ap.add_argument("--output-name", default="fetch_name_0")
     ap.add_argument("--size", type=int, default=800)
     ap.add_argument("--dpi", type=int, default=120)
     ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument("--ort-eps", nargs="*",
+                    default=["CPUExecutionProvider", "CoreMLExecutionProvider"])
+    ap.add_argument("--ort-warmup", type=int, default=1)
     ap.add_argument("--workdir", type=Path, default=Path("artifacts/bench/pdf-warm-metal"))
     ap.add_argument("--no-annotate", action="store_true")
     args = ap.parse_args()
 
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     labels = list(manifest.get("labels", []))
+    onnx_path = args.onnx
+    if onnx_path is None:
+        onnx_text = manifest.get("source", {}).get("onnx_path")
+        onnx_path = Path(onnx_text) if onnx_text else None
     args.workdir.mkdir(parents=True, exist_ok=True)
     input_dir = args.workdir / "inputs"
     output_dir = args.workdir / "outputs"
@@ -150,9 +211,11 @@ def main() -> int:
 
     t0 = time.perf_counter()
     images = render_pdf(args.pdf, args.dpi)
+    pages_chw = []
     batch_rows = []
     for i, img in enumerate(images, 1):
         chw = preprocess(img, args.size)
+        pages_chw.append(chw)
         input_f32 = input_dir / f"page_{i:03d}.f32"
         output_f32 = output_dir / f"page_{i:03d}.f32"
         chw.tofile(input_f32)
@@ -173,6 +236,13 @@ def main() -> int:
     if res.returncode != 0:
         raise RuntimeError(f"warm batch failed:\nSTDERR:\n{res.stderr}\nSTDOUT:\n{res.stdout}")
     cli = json.loads(res.stdout.strip().splitlines()[-1])
+
+    ort_results = []
+    if onnx_path and onnx_path.exists():
+        ort_results = run_ort_batches(onnx_path, pages_chw, args.size, args.ort_eps, args.ort_warmup)
+    elif args.ort_eps:
+        ort_results = [{"provider": ep, "skipped": True, "reason": "onnx path missing"}
+                       for ep in args.ort_eps]
 
     pages = []
     label_counts: Counter[str] = Counter()
@@ -196,11 +266,12 @@ def main() -> int:
         "pdf": str(args.pdf),
         "threshold": args.threshold,
         "cli": cli,
+        "ort": ort_results,
         "total_wall_ms": total_wall_ms,
         "pages": pages,
     }
     (args.workdir / "detections.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-    report = markdown_report(args.pdf, cli, pages, label_counts, total_wall_ms)
+    report = markdown_report(args.pdf, cli, ort_results, pages, label_counts, total_wall_ms)
     (args.workdir / "report.md").write_text(report, encoding="utf-8")
     print(report)
     print(f"wrote {args.workdir / 'detections.json'}")
