@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,7 +47,7 @@ struct PrefixRunResult {
 
 class Engine {
 public:
-    Engine() = default;
+    Engine();
     ~Engine();
 
     bool load_manifest(const std::string & path);
@@ -77,14 +78,29 @@ public:
         int64_t input_value_count,
         std::vector<float> & output_values,
         PrefixRunResult & result);
+    bool prepare_plan_prefix(
+        const std::string & plan_path,
+        const std::string & output_name);
+    bool run_prepared_plan_prefix(
+        const float * input_values,
+        int64_t input_value_count,
+        std::vector<float> & output_values,
+        PrefixRunResult & result);
+    void clear_plan_prefix();
 
     const ManifestSummary & manifest() const { return manifest_; }
     const GgufWeightsSummary & weights() const { return weights_; }
     const std::string & error() const { return error_; }
 
 private:
+    struct PreparedPlanPrefix;
+
     void close_weights();
     bool read_tensor_bytes(const std::string & name, std::vector<uint8_t> & data);
+    bool prepare_plan_prefix_impl(
+        const std::string & plan_path,
+        const std::string & output_name,
+        const std::vector<std::pair<std::string, std::string>> & injects);
     bool run_plan_prefix_impl(
         const std::string & plan_path,
         const std::string & output_name,
@@ -101,6 +117,7 @@ private:
     // Entire GGUF file cached in RAM so per-inference tensor reads are memcpy
     // from memory instead of 1899 fresh ifstream opens against disk each call.
     std::vector<uint8_t> weights_blob_;
+    std::unique_ptr<PreparedPlanPrefix> prepared_prefix_;
     std::string error_;
 };
 

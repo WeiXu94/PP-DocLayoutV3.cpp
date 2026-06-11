@@ -24,7 +24,10 @@ The CMake project builds:
 - `ppdoc_create` / `ppdoc_destroy`
 - `ppdoc_load_manifest`
 - `ppdoc_load_weights`
+- `ppdoc_prepare_plan_prefix`
 - `ppdoc_run_plan_prefix`
+- `ppdoc_run_prepared_plan_prefix`
+- `ppdoc_clear_plan_prefix`
 - `ppdoc_last_error`
 
 `ppdoc_run_plan_prefix` accepts image input as an in-memory `float*` tensor and

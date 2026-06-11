@@ -1,7 +1,12 @@
 #include "pp_doclayout_ggml.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <cmath>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -15,6 +20,7 @@ void usage() {
         << "       [--first-block <input.f32> --output-f32 <output.f32>]\n"
         << "       [--stem-block <input.f32> --output-f32 <output.f32>]\n"
         << "       [--plan <plan.json> --run-prefix <output_name> --input-f32 <input.f32> --output-f32 <output.f32>]\n"
+        << "       [--plan <plan.json> --run-prefix <output_name> --batch-f32-list <list.tsv>]\n"
         << "       [--inject <value_name>=<file.f32> ...]\n"
         << "       [--detect <image>]\n"
         << "\n"
@@ -58,6 +64,81 @@ void print_weights_json(const archon::ppdoc::GgufWeightsSummary & weights) {
     std::cout << "]}";
 }
 
+double elapsed_ms(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+bool read_f32_file(const std::string & path, std::vector<float> & values) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        return false;
+    }
+    const std::streamoff bytes = in.tellg();
+    if (bytes < 0 || bytes % static_cast<std::streamoff>(sizeof(float)) != 0) {
+        return false;
+    }
+    values.resize(static_cast<size_t>(bytes / static_cast<std::streamoff>(sizeof(float))));
+    in.seekg(0, std::ios::beg);
+    if (!values.empty()) {
+        in.read(reinterpret_cast<char *>(values.data()), bytes);
+    }
+    return in.good() || in.eof();
+}
+
+bool write_f32_file(const std::string & path, const std::vector<float> & values) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        return false;
+    }
+    if (!values.empty()) {
+        out.write(reinterpret_cast<const char *>(values.data()),
+                  static_cast<std::streamsize>(values.size() * sizeof(float)));
+    }
+    return out.good();
+}
+
+struct BatchItem {
+    std::string input_f32;
+    std::string output_f32;
+};
+
+bool read_batch_list(const std::string & path, std::vector<BatchItem> & items, std::string & error) {
+    std::ifstream in(path);
+    if (!in) {
+        error = "failed to read batch list: " + path;
+        return false;
+    }
+    std::string line;
+    int line_no = 0;
+    while (std::getline(in, line)) {
+        ++line_no;
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream iss(line);
+        BatchItem item;
+        if (!(iss >> item.input_f32 >> item.output_f32)) {
+            error = "invalid batch list row " + std::to_string(line_no) + ": " + line;
+            return false;
+        }
+        items.push_back(std::move(item));
+    }
+    if (items.empty()) {
+        error = "batch list is empty: " + path;
+        return false;
+    }
+    return true;
+}
+
+double percentile(std::vector<double> values, double q) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const size_t idx = static_cast<size_t>(std::llround(q * static_cast<double>(values.size() - 1)));
+    return values[std::min(idx, values.size() - 1)];
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -69,6 +150,7 @@ int main(int argc, char ** argv) {
     std::string run_prefix_output;
     std::string input_f32;
     std::string output_f32;
+    std::string batch_f32_list;
     std::string detect_image;
     std::vector<std::pair<std::string, std::string>> injects;
     bool summary = false;
@@ -96,6 +178,8 @@ int main(int argc, char ** argv) {
             input_f32 = argv[++i];
         } else if (arg == "--output-f32" && i + 1 < argc) {
             output_f32 = argv[++i];
+        } else if (arg == "--batch-f32-list" && i + 1 < argc) {
+            batch_f32_list = argv[++i];
         } else if (arg == "--inject" && i + 1 < argc) {
             std::string spec = argv[++i];
             auto eq = spec.find('=');
@@ -212,7 +296,89 @@ int main(int argc, char ** argv) {
         std::cout << "],\"output_values\":" << result.output_values << "}\n";
     }
 
-    if (!run_prefix_output.empty()) {
+    if (!batch_f32_list.empty()) {
+        if (plan_path.empty() || run_prefix_output.empty()) {
+            std::cerr << "--batch-f32-list requires --plan and --run-prefix\n";
+            return 2;
+        }
+        if (!injects.empty()) {
+            std::cerr << "--batch-f32-list does not support --inject\n";
+            return 2;
+        }
+        std::vector<BatchItem> items;
+        std::string batch_error;
+        if (!read_batch_list(batch_f32_list, items, batch_error)) {
+            std::cerr << batch_error << "\n";
+            return 1;
+        }
+
+        const auto prepare_t0 = std::chrono::steady_clock::now();
+        if (!engine.prepare_plan_prefix(plan_path, run_prefix_output)) {
+            std::cerr << engine.error() << "\n";
+            return 1;
+        }
+        const double prepare_ms = elapsed_ms(prepare_t0);
+
+        std::vector<double> run_ms;
+        run_ms.reserve(items.size());
+        std::vector<int64_t> output_values;
+        std::string backend;
+        for (const BatchItem & item : items) {
+            std::vector<float> input_values;
+            if (!read_f32_file(item.input_f32, input_values)) {
+                std::cerr << "failed to read batch input f32: " << item.input_f32 << "\n";
+                return 1;
+            }
+            std::vector<float> output_values_f32;
+            archon::ppdoc::PrefixRunResult result;
+            const auto run_t0 = std::chrono::steady_clock::now();
+            if (!engine.run_prepared_plan_prefix(
+                    input_values.data(), static_cast<int64_t>(input_values.size()),
+                    output_values_f32, result)) {
+                std::cerr << engine.error() << "\n";
+                return 1;
+            }
+            run_ms.push_back(elapsed_ms(run_t0));
+            backend = result.backend_name;
+            output_values.push_back(result.output_values);
+            if (!write_f32_file(item.output_f32, output_values_f32)) {
+                std::cerr << "failed to write batch output f32: " << item.output_f32 << "\n";
+                return 1;
+            }
+        }
+        double sum = 0.0;
+        double min_ms = run_ms.empty() ? 0.0 : run_ms[0];
+        double max_ms = run_ms.empty() ? 0.0 : run_ms[0];
+        for (double value : run_ms) {
+            sum += value;
+            min_ms = std::min(min_ms, value);
+            max_ms = std::max(max_ms, value);
+        }
+        const double mean_ms = run_ms.empty() ? 0.0 : sum / static_cast<double>(run_ms.size());
+        std::cout << "{"
+                  << "\"backend\":\"" << json_escape(backend) << "\","
+                  << "\"output_name\":\"" << json_escape(run_prefix_output) << "\","
+                  << "\"batch_count\":" << items.size() << ","
+                  << "\"prepare_ms\":" << prepare_ms << ","
+                  << "\"run_ms_min\":" << min_ms << ","
+                  << "\"run_ms_p50\":" << percentile(run_ms, 0.5) << ","
+                  << "\"run_ms_p90\":" << percentile(run_ms, 0.9) << ","
+                  << "\"run_ms_mean\":" << mean_ms << ","
+                  << "\"run_ms_max\":" << max_ms << ","
+                  << "\"runs\":[";
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (i > 0) {
+                std::cout << ",";
+            }
+            std::cout << "{"
+                      << "\"input_f32\":\"" << json_escape(items[i].input_f32) << "\","
+                      << "\"output_f32\":\"" << json_escape(items[i].output_f32) << "\","
+                      << "\"run_ms\":" << run_ms[i] << ","
+                      << "\"output_values\":" << output_values[i]
+                      << "}";
+        }
+        std::cout << "]}\n";
+    } else if (!run_prefix_output.empty()) {
         if (plan_path.empty() || input_f32.empty() || output_f32.empty()) {
             std::cerr << "--run-prefix requires --plan, --input-f32, and --output-f32\n";
             return 2;
@@ -248,7 +414,7 @@ int main(int argc, char ** argv) {
     }
 
     if (!summary && !smoke && first_block_input.empty() && stem_block_input.empty() &&
-        run_prefix_output.empty() && detect_image.empty()) {
+        run_prefix_output.empty() && batch_f32_list.empty() && detect_image.empty()) {
         usage();
         return 2;
     }

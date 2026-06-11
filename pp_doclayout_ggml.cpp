@@ -732,11 +732,85 @@ std::string backend_name(ggml_backend_t backend) {
 
 } // namespace
 
+struct Engine::PreparedPlanPrefix {
+    struct Upload {
+        ggml_tensor * tensor = nullptr;
+        const void * data = nullptr;
+        size_t bytes = 0;
+    };
+
+    std::string plan_path;
+    std::string output_name;
+    std::vector<std::pair<std::string, std::string>> injects;
+    std::string backend_name_value;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    ggml_context * ctx = nullptr;
+    ggml_context * wctx = nullptr;
+    ggml_backend_buffer_t weights_buf = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+    std::vector<int64_t> output_shape_nchw;
+    int64_t output_values = 0;
+    std::vector<Upload> uploads;
+    std::deque<std::vector<uint8_t>> weight_storage;
+    std::deque<std::vector<float>> param_storage;
+    std::deque<int64_t> i64_param_storage;
+    std::deque<MSDeformConfig> cfg_storage;
+
+    ~PreparedPlanPrefix() { clear(); }
+
+    void clear() {
+        if (weights_buf) {
+            ggml_backend_buffer_free(weights_buf);
+            weights_buf = nullptr;
+        }
+        if (sched) {
+            ggml_backend_sched_free(sched);
+            sched = nullptr;
+        }
+        if (ctx) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+        if (wctx) {
+            ggml_free(wctx);
+            wctx = nullptr;
+        }
+        if (backend_cpu) {
+            ggml_backend_free(backend_cpu);
+            backend_cpu = nullptr;
+        }
+        if (backend) {
+            ggml_backend_free(backend);
+            backend = nullptr;
+        }
+        graph = nullptr;
+        input = nullptr;
+        output = nullptr;
+        uploads.clear();
+        weight_storage.clear();
+        param_storage.clear();
+        i64_param_storage.clear();
+        cfg_storage.clear();
+    }
+};
+
+Engine::Engine() = default;
+
 Engine::~Engine() {
+    clear_plan_prefix();
     close_weights();
 }
 
+void Engine::clear_plan_prefix() {
+    prepared_prefix_.reset();
+}
+
 void Engine::close_weights() {
+    clear_plan_prefix();
     if (weights_ctx_) {
         gguf_free(weights_ctx_);
         weights_ctx_ = nullptr;
@@ -1346,6 +1420,63 @@ bool Engine::run_plan_prefix_memory(
                                 no_injects, output_values, result);
 }
 
+bool Engine::prepare_plan_prefix(
+    const std::string & plan_path,
+    const std::string & output_name) {
+    static const std::vector<std::pair<std::string, std::string>> no_injects;
+    return prepare_plan_prefix_impl(plan_path, output_name, no_injects);
+}
+
+bool Engine::run_prepared_plan_prefix(
+    const float * input_values,
+    int64_t input_value_count,
+    std::vector<float> & output_values,
+    PrefixRunResult & result) {
+    error_.clear();
+    constexpr size_t expected_input_values = 1 * 3 * 800 * 800;
+    if (!prepared_prefix_) {
+        error_ = "run_prepared_plan_prefix requires prepare_plan_prefix first";
+        return false;
+    }
+    if (!input_values || input_value_count != static_cast<int64_t>(expected_input_values)) {
+        error_ = "input tensor has wrong value count: " + std::to_string(input_value_count);
+        return false;
+    }
+    PreparedPlanPrefix & prepared = *prepared_prefix_;
+    ggml_backend_tensor_set(prepared.input, input_values, 0, expected_input_values * sizeof(float));
+
+    const int64_t t_compute0 = ggml_time_us();
+    if (ggml_backend_sched_graph_compute(prepared.sched, prepared.graph) != GGML_STATUS_SUCCESS) {
+        error_ = "GGML plan-prefix graph failed";
+        return false;
+    }
+    if (std::getenv("PPDOC_TIMING")) {
+        fprintf(stderr, "[ppdoc] graph_compute_ms=%.1f\n",
+                (ggml_time_us() - t_compute0) / 1000.0);
+    }
+
+    output_values.assign(static_cast<size_t>(prepared.output_values), 0.0f);
+    const size_t output_bytes = output_values.size() * sizeof(float);
+    if (output_bytes > ggml_nbytes(prepared.output)) {
+        error_ = "output copy size mismatch for " + prepared.output_name +
+                 ": type=" + ggml_type_name(prepared.output->type) + " ne=[" +
+                 std::to_string(prepared.output->ne[0]) + "," +
+                 std::to_string(prepared.output->ne[1]) + "," +
+                 std::to_string(prepared.output->ne[2]) + "," +
+                 std::to_string(prepared.output->ne[3]) + "] copy_bytes=" +
+                 std::to_string(output_bytes) + " tensor_bytes=" +
+                 std::to_string(ggml_nbytes(prepared.output));
+        return false;
+    }
+    ggml_backend_tensor_get(prepared.output, output_values.data(), 0, output_bytes);
+
+    result.backend_name = prepared.backend_name_value;
+    result.output_name = prepared.output_name;
+    result.output_shape_nchw = prepared.output_shape_nchw;
+    result.output_values = prepared.output_values;
+    return true;
+}
+
 bool Engine::run_plan_prefix_impl(
     const std::string & plan_path,
     const std::string & output_name,
@@ -1354,11 +1485,31 @@ bool Engine::run_plan_prefix_impl(
     const std::vector<std::pair<std::string, std::string>> & injects,
     std::vector<float> & output_values,
     PrefixRunResult & result) {
+    if (!prepare_plan_prefix_impl(plan_path, output_name, injects)) {
+        return false;
+    }
+    return run_prepared_plan_prefix(input_values, input_value_count, output_values, result);
+}
+
+bool Engine::prepare_plan_prefix_impl(
+    const std::string & plan_path,
+    const std::string & output_name,
+    const std::vector<std::pair<std::string, std::string>> & injects) {
     error_.clear();
     if (!weights_ctx_ || !weights_meta_ctx_) {
         error_ = "run_plan_prefix requires --weights";
         return false;
     }
+    if (prepared_prefix_ && prepared_prefix_->plan_path == plan_path &&
+        prepared_prefix_->output_name == output_name && prepared_prefix_->injects == injects) {
+        return true;
+    }
+    clear_plan_prefix();
+
+    auto prepared = std::make_unique<PreparedPlanPrefix>();
+    prepared->plan_path = plan_path;
+    prepared->output_name = output_name;
+    prepared->injects = injects;
 
     const std::string plan_text = read_file(plan_path);
     if (plan_text.empty()) {
@@ -1393,14 +1544,9 @@ bool Engine::run_plan_prefix_impl(
         nodes.push_back(std::move(node));
     }
 
-    const size_t expected_input_values = 1 * 3 * 800 * 800;
-    if (!input_values || input_value_count != static_cast<int64_t>(expected_input_values)) {
-        error_ = "input tensor has wrong value count: " + std::to_string(input_value_count);
-        return false;
-    }
-
     std::string backend_error;
-    ggml_backend_t backend = init_preferred_backend(backend_error);
+    ggml_backend_t & backend = prepared->backend;
+    backend = init_preferred_backend(backend_error);
     if (!backend) {
         error_ = backend_error;
         return false;
@@ -1410,7 +1556,7 @@ bool Engine::run_plan_prefix_impl(
     // preferred backend (e.g. Metal) when supported, and fall back to CPU for the
     // rest (custom kernels, and ops the GPU backend lacks). Skipped when the
     // preferred backend is already the CPU (single-backend schedule).
-    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_t & backend_cpu = prepared->backend_cpu;
     {
         ggml_backend_dev_t pref_dev = ggml_backend_get_device(backend);
         if (!pref_dev || ggml_backend_dev_type(pref_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -1430,13 +1576,11 @@ bool Engine::run_plan_prefix_impl(
     // op_offload=true: offload heavy ops (mat-mul, and the im2col+mat-mul convs)
     // to the GPU even though the weights live in CPU-side buffers; the scheduler
     // copies operands as needed. Without it, ops co-locate with their CPU weights.
-    ggml_backend_sched_t sched = ggml_backend_sched_new(
+    ggml_backend_sched_t & sched = prepared->sched;
+    sched = ggml_backend_sched_new(
         sched_backends, nullptr, n_sched_backends, kMaxGraphNodes, false, true);
     if (!sched) {
-        if (backend_cpu) {
-            ggml_backend_free(backend_cpu);
-        }
-        ggml_backend_free(backend);
+        prepared->clear();
         error_ = "failed to create GGML backend scheduler";
         return false;
     }
@@ -1448,13 +1592,10 @@ bool Engine::run_plan_prefix_impl(
     params.mem_size = ctx_size;
     params.mem_buffer = nullptr;
     params.no_alloc = true;
-    ggml_context * ctx = ggml_init(params);
+    ggml_context * & ctx = prepared->ctx;
+    ctx = ggml_init(params);
     if (!ctx) {
-        ggml_backend_sched_free(sched);
-        if (backend_cpu) {
-            ggml_backend_free(backend_cpu);
-        }
-        ggml_backend_free(backend);
+        prepared->clear();
         error_ = "failed to allocate GGML context (size=" + std::to_string(ctx_size) +
                  " tensors=" + std::to_string(kMaxTensors) + " nodes=" + std::to_string(kMaxGraphNodes) + ")";
         return false;
@@ -1465,15 +1606,11 @@ bool Engine::run_plan_prefix_impl(
     // conv ops that consume them to the GPU (ggml only offloads ops whose weight
     // operand lives in such a buffer). Compute tensors + runtime inputs stay in ctx.
     ggml_init_params wparams = params;
-    ggml_context * wctx = ggml_init(wparams);
-    ggml_backend_buffer_t weights_buf = nullptr;
+    ggml_context * & wctx = prepared->wctx;
+    ggml_backend_buffer_t & weights_buf = prepared->weights_buf;
+    wctx = ggml_init(wparams);
     if (!wctx) {
-        ggml_free(ctx);
-        ggml_backend_sched_free(sched);
-        if (backend_cpu) {
-            ggml_backend_free(backend_cpu);
-        }
-        ggml_backend_free(backend);
+        prepared->clear();
         error_ = "failed to allocate GGML weights context";
         return false;
     }
@@ -1482,32 +1619,18 @@ bool Engine::run_plan_prefix_impl(
         if (buffer) {
             ggml_backend_buffer_free(buffer);
         }
-        if (weights_buf) {
-            ggml_backend_buffer_free(weights_buf);
-        }
-        ggml_backend_sched_free(sched);
-        ggml_free(ctx);
-        ggml_free(wctx);
-        if (backend_cpu) {
-            ggml_backend_free(backend_cpu);
-        }
-        ggml_backend_free(backend);
+        prepared->clear();
     };
 
-    struct Upload {
-        ggml_tensor * tensor;
-        const void * data;
-        size_t bytes;
-    };
-    std::vector<Upload> uploads;
+    auto & uploads = prepared->uploads;
     // deque keeps element addresses stable across push_back so the Upload
     // pointers above stay valid until we copy the data into backend buffers.
-    std::deque<std::vector<uint8_t>> weight_storage;
-    std::deque<std::vector<float>> param_storage;
-    std::deque<int64_t> i64_param_storage;
+    auto & weight_storage = prepared->weight_storage;
+    auto & param_storage = prepared->param_storage;
+    auto & i64_param_storage = prepared->i64_param_storage;
     // Stable storage for fused-op configs whose address is handed to ggml as the
     // custom-op userdata (must outlive graph compute).
-    std::deque<MSDeformConfig> cfg_storage;
+    auto & cfg_storage = prepared->cfg_storage;
 
     std::unordered_map<std::string, std::string> inject_map;
     for (const auto & kv : injects) {
@@ -1518,7 +1641,7 @@ bool Engine::run_plan_prefix_impl(
 
     ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 800, 800, 3, 1);
     ggml_set_name(input, "image");
-    uploads.push_back({input, input_values, expected_input_values * sizeof(float)});
+    prepared->input = input;
     values["image"] = input;
 
     // Graph inputs im_shape / scale_factor: constant for a fixed 800x800 pipeline.
@@ -3488,7 +3611,7 @@ bool Engine::run_plan_prefix_impl(
         return false;
     }
     for (size_t upload_index = 0; upload_index < uploads.size(); ++upload_index) {
-        const Upload & upload = uploads[upload_index];
+        const auto & upload = uploads[upload_index];
         // The scheduler only allocates tensors reachable from the requested
         // output; leaves created for unrelated branches get no buffer and need
         // no upload (their data is never read).
@@ -3510,37 +3633,12 @@ bool Engine::run_plan_prefix_impl(
         ggml_backend_tensor_set(upload.tensor, upload.data, 0, upload.bytes);
     }
 
-    const int64_t t_compute0 = ggml_time_us();
-    if (ggml_backend_sched_graph_compute(sched, graph) != GGML_STATUS_SUCCESS) {
-        cleanup(nullptr);
-        error_ = "GGML plan-prefix graph failed";
-        return false;
-    }
-    if (std::getenv("PPDOC_TIMING")) {
-        fprintf(stderr, "[ppdoc] graph_compute_ms=%.1f\n",
-                (ggml_time_us() - t_compute0) / 1000.0);
-    }
-
-    output_values.assign(static_cast<size_t>(ggml_nelements(output)), 0.0f);
-    const size_t output_bytes = output_values.size() * sizeof(float);
-    if (output_bytes > ggml_nbytes(output)) {
-        cleanup(nullptr);
-        error_ = "output copy size mismatch for " + output_name +
-                 ": type=" + ggml_type_name(output->type) + " ne=[" +
-                 std::to_string(output->ne[0]) + "," + std::to_string(output->ne[1]) + "," +
-                 std::to_string(output->ne[2]) + "," + std::to_string(output->ne[3]) +
-                 "] copy_bytes=" + std::to_string(output_bytes) +
-                 " tensor_bytes=" + std::to_string(ggml_nbytes(output));
-        return false;
-    }
-    ggml_backend_tensor_get(output, output_values.data(), 0, output_values.size() * sizeof(float));
-
-    result.backend_name = backend_name(backend);
-    result.output_name = output_name;
-    result.output_shape_nchw = {output->ne[3], output->ne[2], output->ne[1], output->ne[0]};
-    result.output_values = static_cast<int64_t>(output_values.size());
-
-    cleanup(nullptr);
+    prepared->graph = graph;
+    prepared->output = output;
+    prepared->backend_name_value = backend_name(backend);
+    prepared->output_shape_nchw = {output->ne[3], output->ne[2], output->ne[1], output->ne[0]};
+    prepared->output_values = static_cast<int64_t>(ggml_nelements(output));
+    prepared_prefix_ = std::move(prepared);
     return true;
 }
 
