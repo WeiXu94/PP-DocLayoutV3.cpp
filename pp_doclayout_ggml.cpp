@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "ggml-custom-kernels.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -332,11 +333,18 @@ void same_upper_pad(int64_t in, int64_t kernel, int64_t stride, int64_t dilation
     end = total - begin;
 }
 
-// Elementwise erf for ONNX `Erf` (ggml has no standalone erf op). CPU-only, which
-// is fine here since the engine runs on the CPU backend. Both tensors are
-// contiguous f32; work is split across rows by (ith, nth).
-void erf_custom_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+// Static headers tagging custom ops the Metal backend can execute natively
+// (see ggml-custom-kernels.h). The CPU callbacks ignore them.
+ggml_custom_kernel_hdr kErfHdr       = {GGML_CUSTOM_KERNEL_MAGIC, GGML_CUSTOM_KERNEL_ERF};
+ggml_custom_kernel_hdr kReduceMaxHdr = {GGML_CUSTOM_KERNEL_MAGIC, GGML_CUSTOM_KERNEL_REDUCE_MAX};
+ggml_custom_kernel_hdr kReduceMinHdr = {GGML_CUSTOM_KERNEL_MAGIC, GGML_CUSTOM_KERNEL_REDUCE_MIN};
+ggml_custom_kernel_hdr kReduceSumHdr = {GGML_CUSTOM_KERNEL_MAGIC, GGML_CUSTOM_KERNEL_REDUCE_SUM};
+
+// Elementwise erf for ONNX `Erf` (ggml has no standalone erf op). CPU fallback
+// for the tagged custom op; both tensors are contiguous f32.
+void erf_custom_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
     (void) userdata;
+    const ggml_tensor * a = dst->src[0];
     const int64_t total = ggml_nelements(a);
     const auto * src = static_cast<const float *>(a->data);
     auto * out = static_cast<float *>(dst->data);
@@ -345,20 +353,6 @@ void erf_custom_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, v
     const int64_t end = std::min(total, start + chunk);
     for (int64_t i = start; i < end; ++i) {
         out[i] = std::erf(src[i]);
-    }
-}
-
-// Elementwise floor for ONNX `Floor`. CPU-only, contiguous f32.
-void floor_custom_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
-    (void) userdata;
-    const int64_t total = ggml_nelements(a);
-    const auto * src = static_cast<const float *>(a->data);
-    auto * out = static_cast<float *>(dst->data);
-    const int64_t chunk = (total + nth - 1) / nth;
-    const int64_t start = static_cast<int64_t>(ith) * chunk;
-    const int64_t end = std::min(total, start + chunk);
-    for (int64_t i = start; i < end; ++i) {
-        out[i] = std::floor(src[i]);
     }
 }
 
@@ -427,21 +421,6 @@ void scatter_nd_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
     }
 }
 
-// F32 to I32 conversion for row-gather index tensors.
-void f32_to_i32_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    (void) userdata;
-    const ggml_tensor * src = dst->src[0];
-    const size_t total = static_cast<size_t>(ggml_nelements(src));
-    const auto * sp = static_cast<const float *>(src->data);
-    auto * out = static_cast<int32_t *>(dst->data);
-    const int64_t chunk = static_cast<int64_t>((total + static_cast<size_t>(nth) - 1) / static_cast<size_t>(nth));
-    const size_t start = static_cast<size_t>(ith) * static_cast<size_t>(chunk);
-    const size_t end = std::min(total, start + static_cast<size_t>(chunk));
-    for (size_t i = start; i < end; ++i) {
-        out[i] = static_cast<int32_t>(sp[i]);
-    }
-}
-
 // Bilinear GridSample (align_corners=0, padding_mode=zeros), the core of
 // deformable attention. data = src[0] ggml [W, H, C, N]; grid = src[1] ggml
 // [2, W_out, H_out, N]; dst ggml [W_out, H_out, C, N]. CPU-only, contiguous f32.
@@ -502,10 +481,10 @@ void grid_sample_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
 //   src[2] attn    ne=[L*P, heads, Q, 1]       (ONNX [1, Q, heads, L*P], post-softmax)
 //   src[3] refpts  ne=[4, 1, Q, 1]             (ONNX [1, Q, 1, 4]; cx,cy,w,h)
 // dst ne=[Q, D, heads, 1] (ONNX [heads, D, Q] = the per-query attended values).
-struct MSDeformConfig {
-    int heads, levels, points, head_dim;
-    int hl[8], wl[8], level_off[8];
-};
+// The config struct is the tagged-userdata layout from ggml-custom-kernels.h
+// so the Metal backend can execute this op natively; this CPU callback is the
+// fallback and reference implementation.
+using MSDeformConfig = ggml_custom_kernel_msdeform_attn;
 
 void msdeform_attn_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
     const auto * cfg = static_cast<const MSDeformConfig *>(userdata);
@@ -1949,6 +1928,7 @@ bool Engine::run_plan_prefix_impl(
             return false;
         }
         MSDeformConfig cfg{};
+        cfg.hdr = {GGML_CUSTOM_KERNEL_MAGIC, GGML_CUSTOM_KERNEL_MSDEFORM_ATTN};
         cfg.head_dim = static_cast<int>(value->ne[0]);
         cfg.heads = static_cast<int>(value->ne[1]);
         cfg.levels = static_cast<int>(sizes.size());
@@ -2326,9 +2306,7 @@ bool Engine::run_plan_prefix_impl(
                 } else if (gather_index.count(name)) {
                     ggml_tensor * gi = gather_index[name];
                     ggml_tensor * gi_c = ggml_is_contiguous(gi) ? gi : ggml_cont(ctx, gi);
-                    ggml_tensor * args[1] = {gi_c};
-                    t = ggml_custom_4d(ctx, GGML_TYPE_F32, gi->ne[0], gi->ne[1], gi->ne[2],
-                                       gi->ne[3], args, 1, i32_to_f32_op, GGML_N_TASKS_MAX, nullptr);
+                    t = ggml_cast(ctx, gi_c, GGML_TYPE_F32);
                     const int64_t elems = ggml_nelements(t);
                     std::vector<int64_t> part_shape = first_shape;
                     int64_t non_axis_elems = 1;
@@ -2348,7 +2326,10 @@ bool Engine::run_plan_prefix_impl(
                     auto vit = values.find(name);
                     if (vit != values.end()) {
                         t = vit->second;
-                        if (t->type != GGML_TYPE_F32) {
+                        if (t->type == GGML_TYPE_I32) {
+                            ggml_tensor * cont = ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
+                            t = ggml_cast(ctx, cont, GGML_TYPE_F32);
+                        } else if (t->type != GGML_TYPE_F32) {
                             ggml_tensor * args[1] = {ggml_is_contiguous(t) ? t : ggml_cont(ctx, t)};
                             t = ggml_custom_4d(ctx, GGML_TYPE_F32, t->ne[0], t->ne[1], t->ne[2],
                                                t->ne[3], args, 1, i32_to_f32_op, GGML_N_TASKS_MAX, nullptr);
@@ -2598,9 +2579,15 @@ bool Engine::run_plan_prefix_impl(
                 cleanup(nullptr);
                 return false;
             }
-            produced = node.op_type == "Sigmoid"
-                           ? ggml_sigmoid(ctx, x)
-                           : ggml_map_custom1(ctx, x, erf_custom_op, GGML_N_TASKS_MAX, nullptr);
+            if (node.op_type == "Sigmoid") {
+                produced = ggml_sigmoid(ctx, x);
+            } else {
+                ggml_tensor * cont = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+                ggml_tensor * args[1] = {cont};
+                produced = ggml_custom_4d(ctx, GGML_TYPE_F32, cont->ne[0], cont->ne[1],
+                                          cont->ne[2], cont->ne[3], args, 1, erf_custom_op,
+                                          GGML_N_TASKS_MAX, &kErfHdr);
+            }
             onnx_shapes[node.outputs[0]] = get_onnx_shape(node.inputs[0]);
         } else if (node.op_type == "Squeeze" || node.op_type == "Unsqueeze") {
             // Integer shape vectors carry no rank, so pass them through unchanged.
@@ -2701,8 +2688,10 @@ bool Engine::run_plan_prefix_impl(
                 return false;
             }
             int64_t to_type = attr_int(node.attrs, "to", 1);
-            if ((to_type == 1 || to_type == 0) &&
-                (x->type == GGML_TYPE_I32 || x->type == GGML_TYPE_I64)) {
+            if ((to_type == 1 || to_type == 0) && x->type == GGML_TYPE_I32) {
+                ggml_tensor * cont = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+                produced = ggml_cast(ctx, cont, GGML_TYPE_F32);
+            } else if ((to_type == 1 || to_type == 0) && x->type == GGML_TYPE_I64) {
                 ggml_tensor * cont = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
                 ggml_tensor * args[1] = {cont};
                 produced = ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2],
@@ -2819,8 +2808,11 @@ bool Engine::run_plan_prefix_impl(
                         : node.op_type == "ReduceMin"
                         ? reduce_last_axis_op<ReduceKind::Min>
                         : reduce_last_axis_op<ReduceKind::Sum>;
+                    ggml_custom_kernel_hdr * hdr2 = node.op_type == "ReduceMax" ? &kReduceMaxHdr
+                                                  : node.op_type == "ReduceMin" ? &kReduceMinHdr
+                                                                                : &kReduceSumHdr;
                     ggml_tensor * flat = ggml_custom_4d(ctx, GGML_TYPE_F32, rows, 1, 1, 1,
-                        src_args, 1, fun2, GGML_N_TASKS_MAX, nullptr);
+                        src_args, 1, fun2, GGML_N_TASKS_MAX, hdr2);
                     const bool kd = attr_int(node.attrs, "keepdims", 1) != 0;
                     std::vector<int64_t> out_shape = in_shape;
                     if (kd) {
@@ -2850,8 +2842,11 @@ bool Engine::run_plan_prefix_impl(
                                    : node.op_type == "ReduceMin"
                                        ? reduce_last_axis_op<ReduceKind::Min>
                                        : reduce_last_axis_op<ReduceKind::Sum>;
+            ggml_custom_kernel_hdr * hdr = node.op_type == "ReduceMax" ? &kReduceMaxHdr
+                                         : node.op_type == "ReduceMin" ? &kReduceMinHdr
+                                                                       : &kReduceSumHdr;
             ggml_tensor * flat = ggml_custom_4d(ctx, GGML_TYPE_F32, rows, 1, 1, 1, src_args, 1, fun,
-                                                GGML_N_TASKS_MAX, nullptr);
+                                                GGML_N_TASKS_MAX, hdr);
             const bool keepdims = attr_int(node.attrs, "keepdims", 1) != 0;
             std::vector<int64_t> out_shape = in_shape;
             if (keepdims) {
@@ -3174,11 +3169,7 @@ bool Engine::run_plan_prefix_impl(
             if (idx_tensor->type != GGML_TYPE_I32) {
                 ggml_tensor * cont = ggml_is_contiguous(idx_tensor) ? idx_tensor
                                                                     : ggml_cont(ctx, idx_tensor);
-                ggml_tensor * args[1] = {cont};
-                idx_tensor =
-                    ggml_custom_4d(ctx, GGML_TYPE_I32, idx_tensor->ne[0], idx_tensor->ne[1],
-                                   idx_tensor->ne[2], idx_tensor->ne[3], args, 1,
-                                   f32_to_i32_op, GGML_N_TASKS_MAX, nullptr);
+                idx_tensor = ggml_cast(ctx, cont, GGML_TYPE_I32);
             }
             if (gather_data->ne[2] != idx_tensor->ne[1] ||
                 gather_data->ne[3] != idx_tensor->ne[2] ||
@@ -3283,7 +3274,7 @@ bool Engine::run_plan_prefix_impl(
                 cleanup(nullptr);
                 return false;
             }
-            produced = ggml_map_custom1(ctx, x, floor_custom_op, GGML_N_TASKS_MAX, nullptr);
+            produced = ggml_floor(ctx, x);
             onnx_shapes[node.outputs[0]] = get_onnx_shape(node.inputs[0]);
         } else if (node.op_type == "Mod") {
             ggml_tensor * x = resolve(node.inputs[0]);
@@ -3292,7 +3283,10 @@ bool Engine::run_plan_prefix_impl(
                 cleanup(nullptr);
                 return false;
             }
-            if (x->type == GGML_TYPE_I32 || x->type == GGML_TYPE_I64) {
+            if (x->type == GGML_TYPE_I32) {
+                ggml_tensor * cont = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+                x = ggml_cast(ctx, cont, GGML_TYPE_F32);
+            } else if (x->type == GGML_TYPE_I64) {
                 ggml_tensor * cont = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
                 ggml_tensor * args[1] = {cont};
                 x = ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2],
@@ -3311,7 +3305,7 @@ bool Engine::run_plan_prefix_impl(
             param_storage.push_back({divisor});
             uploads.push_back({denom, param_storage.back().data(), sizeof(float)});
             ggml_tensor * quot = ggml_div(ctx, x, denom);
-            ggml_tensor * fquot = ggml_map_custom1(ctx, quot, floor_custom_op, GGML_N_TASKS_MAX, nullptr);
+            ggml_tensor * fquot = ggml_floor(ctx, quot);
             produced = ggml_sub(ctx, x, ggml_mul(ctx, fquot, denom));
             onnx_shapes[node.outputs[0]] = get_onnx_shape(node.inputs[0]);
         } else if (node.op_type == "Einsum") {
@@ -3360,11 +3354,7 @@ bool Engine::run_plan_prefix_impl(
                     ggml_tensor * gi_c = ggml_is_contiguous(gi->second)
                                              ? gi->second
                                              : ggml_cont(ctx, gi->second);
-                    ggml_tensor * args[1] = {gi_c};
-                    scatter_idx = ggml_custom_4d(ctx, GGML_TYPE_F32, gi->second->ne[0],
-                                                  gi->second->ne[1], gi->second->ne[2],
-                                                  gi->second->ne[3], args, 1, i32_to_f32_op,
-                                                  GGML_N_TASKS_MAX, nullptr);
+                    scatter_idx = ggml_cast(ctx, gi_c, GGML_TYPE_F32);
                 }
             }
             if (!canvas || !scatter_idx || !updates) {
@@ -3471,14 +3461,16 @@ bool Engine::run_plan_prefix_impl(
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, kMaxGraphNodes, false);
     ggml_build_forward_expand(graph, output);
 
-    // Pre-allocate all constant/weight leaves (wctx) in a host buffer tagged
-    // USAGE_WEIGHTS. This is what makes the scheduler offload the matmul/conv ops
-    // that consume them to the GPU (it only offloads ops whose weight operand is in
-    // such a buffer). Runtime inputs stay in ctx and are scheduler-allocated.
+    // Pre-allocate all constant/weight leaves (wctx) in the primary backend's
+    // buffer (GPU when Metal is active), tagged USAGE_WEIGHTS. With weights
+    // resident on the GPU the scheduler assigns every op that consumes them to
+    // the GPU directly — including the small per-channel BN add/mul constants
+    // that would otherwise pin all elementwise ops to CPU and split the graph
+    // at every conv. Runtime inputs stay in ctx and are scheduler-allocated.
     {
-        ggml_backend_buffer_type_t host_buft =
-            ggml_backend_get_default_buffer_type(backend_cpu ? backend_cpu : backend);
-        weights_buf = ggml_backend_alloc_ctx_tensors_from_buft(wctx, host_buft);
+        ggml_backend_buffer_type_t weights_buft =
+            ggml_backend_get_default_buffer_type(backend);
+        weights_buf = ggml_backend_alloc_ctx_tensors_from_buft(wctx, weights_buft);
         if (!weights_buf) {
             cleanup(nullptr);
             error_ = "failed to allocate GGML weights buffer";
